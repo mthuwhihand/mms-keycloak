@@ -8,6 +8,7 @@ services:
     environment:
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
+      REDIRECT_URL_DEFAULT: https://mms.vitrust.app
     volumes:
       - keycloak_data:/opt/keycloak/data
     restart: unless-stopped

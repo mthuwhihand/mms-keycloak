@@ -16,6 +16,7 @@
  */
 package org.keycloak.services.resources.admin;
 
+import jakarta.ws.rs.core.*;
 import org.eclipse.microprofile.openapi.annotations.Operation;
 import org.eclipse.microprofile.openapi.annotations.extensions.Extension;
 import org.eclipse.microprofile.openapi.annotations.parameters.Parameter;
@@ -25,19 +26,16 @@ import org.jboss.resteasy.annotations.cache.NoCache;
 import org.keycloak.common.ClientConnection;
 import org.keycloak.common.Profile;
 import org.keycloak.common.util.ObjectUtil;
+import org.keycloak.common.util.Time;
 import org.keycloak.events.admin.OperationType;
 import org.keycloak.events.admin.ResourceType;
-import org.keycloak.models.Constants;
-import org.keycloak.models.GroupModel;
-import org.keycloak.models.KeycloakSession;
-import org.keycloak.models.ModelDuplicateException;
-import org.keycloak.models.ModelException;
-import org.keycloak.models.RealmModel;
-import org.keycloak.models.UserModel;
+import org.keycloak.models.*;
 import org.keycloak.models.utils.ModelToRepresentation;
 import org.keycloak.models.utils.RepresentationToModel;
 import org.keycloak.models.utils.StripSecretsUtils;
 import org.keycloak.policy.PasswordPolicyNotMetException;
+import org.keycloak.protocol.oidc.OIDCLoginProtocol;
+import org.keycloak.protocol.oidc.utils.RedirectUtils;
 import org.keycloak.representations.idm.UserRepresentation;
 import org.keycloak.services.ErrorResponse;
 import org.keycloak.services.ForbiddenException;
@@ -56,9 +54,7 @@ import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.QueryParam;
-import jakarta.ws.rs.core.HttpHeaders;
-import jakarta.ws.rs.core.MediaType;
-import jakarta.ws.rs.core.Response;
+
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -71,6 +67,9 @@ import java.util.stream.Stream;
 
 import static org.keycloak.models.utils.KeycloakModelUtils.findGroupByPath;
 import static org.keycloak.userprofile.UserProfileContext.USER_API;
+
+import org.keycloak.authentication.actiontoken.execactions.ExecuteActionsActionToken;
+import org.keycloak.services.resources.LoginActionsService;
 
 /**
  * Base resource for managing users
@@ -118,7 +117,11 @@ public class UsersResource {
     @Consumes(MediaType.APPLICATION_JSON)
     @Tag(name = KeycloakOpenAPI.Admin.Tags.USERS)
     @Operation( summary = "Create a new user Username must be unique.")
-    public Response createUser(final UserRepresentation rep) {
+    public Response createUser(
+            @QueryParam(OIDCLoginProtocol.REDIRECT_URI_PARAM) String redirectUri,
+            @QueryParam(OIDCLoginProtocol.CLIENT_ID_PARAM) String clientId,
+            @QueryParam("lifespan") Integer lifespan,
+            final UserRepresentation rep) {
         // first check if user has manage rights
         try {
             auth.users().requireManage();
@@ -169,11 +172,50 @@ public class UsersResource {
             RepresentationToModel.createCredentials(rep, session, realm, user, true);
             adminEvent.operation(OperationType.CREATE).resourcePath(session.getContext().getUri(), user.getId()).representation(rep).success();
 
+            // --- Create link set password ---
+            List<String> actions = Collections.singletonList(UserModel.RequiredAction.UPDATE_PASSWORD.name());
+            int actionLifespan = lifespan != null ? lifespan : realm.getActionTokenGeneratedByAdminLifespan();
+            int expiration = Time.currentTime() + actionLifespan;
+
+            String effectiveClientId = clientId != null ? clientId : Constants.ACCOUNT_MANAGEMENT_CLIENT_ID;
+            ClientModel client = realm.getClientByClientId(effectiveClientId);
+
+            // --- Verify redirectUri ---
+            if (redirectUri == null) {
+                // fallback default
+                redirectUri = System.getenv("REDIRECT_URL_DEFAULT");
+            }
+
+            String verifiedRedirect = RedirectUtils.verifyRedirectUri(session, redirectUri, client);
+            if (verifiedRedirect == null) {
+                throw ErrorResponse.error("Invalid redirect URI", Response.Status.BAD_REQUEST);
+            }
+            redirectUri = verifiedRedirect;
+
+            ExecuteActionsActionToken token = new ExecuteActionsActionToken(
+                    user.getId(),
+                    user.getEmail(),
+                    expiration,
+                    actions,
+                    redirectUri,
+                    Constants.ACCOUNT_MANAGEMENT_CLIENT_ID
+            );
+
+            String setPasswordLink = LoginActionsService
+                    .actionTokenProcessor(session.getContext().getUri())
+                    .queryParam("key", token.serialize(session, realm, session.getContext().getUri()))
+                    .build(realm.getName())
+                    .toString();
+
             if (session.getTransactionManager().isActive()) {
                 session.getTransactionManager().commit();
             }
 
-            return Response.created(session.getContext().getUri().getAbsolutePathBuilder().path(user.getId()).build()).build();
+            Map<String, String> result = new HashMap<>();
+            result.put("user_id", user.getId());
+            result.put("set_password_link", setPasswordLink);
+            return Response.ok(result).build();
+                        
         } catch (ModelDuplicateException e) {
             if (session.getTransactionManager().isActive()) {
                 session.getTransactionManager().setRollbackOnly();
